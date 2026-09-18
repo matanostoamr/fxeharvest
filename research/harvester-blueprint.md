@@ -381,6 +381,82 @@ stops fired in the week. Both are single-sample facts, not evidence of anything.
 
 ---
 
+## 7c. Field notes — v2, after the self-cancellation fix
+
+Same broker, same instrument, same week, same inputs (EUR/USD M15, 2026.08.27–09.02,
+384 bars, 100% real ticks, £500 @ 1:30). Only the section-4 gating changed.
+
+**The fix worked, and the size of the effect is the whole story.**
+
+| | v1 | v2 |
+|---|---|---|
+| pendings placed | 1,053 | 88 |
+| pendings filled | 1 | 14 |
+| fill rate | 0.095% | **15.9%** |
+| net | +£0.33 | +£5.00 |
+| profit factor | 17.5 | 18.86 |
+
+A **168× improvement in order-to-fill ratio.** Note also that v2 placed *fewer*
+orders (88 vs 1,053) — v1's order count was almost entirely churn, the same ladder
+being re-posted after cancelling itself.
+
+**Cost model confirmed a third time.** Commission £0.56 against gross £5.54 = a
+**10.1% cost ratio**, versus 10.0% predicted in §0. Three independent measurements
+now (10.8%, 10.1%, 10.0% modelled). The cost arithmetic is settled; stop re-deriving it.
+
+**Geometry still exact at non-floor spacing.** v1 only ever ran at the 7.0-pip floor.
+v2 saw ATR-driven spacing up to **11.44 pips**, and the geometry held: order 21's stop
+at 1.18101 is exactly 2 × D_max (68.6 pips) from its anchor, per §4.
+
+**The headline numbers are meaningless, and it matters that you know why.**
+100% win rate. Profit factor 18.86. Sharpe 7.74. LR Correlation 1.00. Max equity
+drawdown 0.33%. This is not a good result — it is **what every grid looks like
+immediately before its first stop-out.** Zero basket stops fired. The loss
+distribution has not been sampled at all, so every ratio above is computed from a
+truncated sample and is upward-biased by an unknown amount.
+
+**The number that decides viability, quantified.** From the measured £0.0791/pip
+(0.01 lot) and the 7-pip geometry:
+
+- level depths from anchor: 7.00 / 15.75 / 26.25 pips; D_max = 6 × 7 = 42 pips
+- aggregate adverse excursion at the stop: 35.0 + 26.25 + 15.75 = **77.0 pips = £6.09**
+- net per winning cycle: £5.00 / 14 = **£0.357**
+- → **17.1 winning cycles are needed to pay for one basket stop**
+
+The week banked £5.00 = **0.82 stop-outs' worth of profit.** At 14 cycles/week,
+break-even requires basket stops to be rarer than **once every 1.22 weeks**. That is
+the entire question, and one week cannot answer it.
+
+**RATIO is still undefined.** RATIO = (TPs per stop-out) / (stop-out cost in TP units)
+needs a stop-out in the denominator. Zero fired. On zero-edge synthetic data RATIO sits
+at ~0.35 (stable 0.31–0.39 across all 64 geometry combinations from §6); real data must
+show **> 1.0**. Until a sample contains stop-outs, the strategy is untested — not
+promising, not broken. Untested.
+
+**A slippage warning hiding in the deal list.** Deal 7 entered 1.16589 and exited
+1.16509 — **8 pips captured on a 5-pip target, in 3 seconds**, +£0.59 instead of
+£0.40. That is a gap through the TP in our favour. The same mechanism runs the other
+way on the basket stop, which is a *market* order by design (§1). Do not read
+favourable gaps as edge; read them as evidence that gaps happen.
+
+**Hold times are wide:** min 0:00:03, max 15:54:57, mean 3:45:06. A cycle can sit
+open across a session boundary, which is what `InpFlatOnFriday` and the rollover
+blackout exist for.
+
+**What the sample cannot support:** 384 bars is roughly 4.5 trading days. Any
+statement about expectancy, drawdown or win rate from this run is noise. The minimum
+useful sample is **2+ years of M15 real ticks**, chosen because it must contain the
+regimes that produce stop-outs (trend bursts, gap opens, event days) — not because
+two years is a round number.
+
+**If fills stay sparse** at 15.9%, the only honest lever is lowering
+`InpSpacingMinPips` toward 5, which immediately re-opens the cost-ratio trade-off
+argued in §1 of `micro-harvest-verdict.md`. Tighter spacing buys trade frequency with
+cost ratio and with a smaller D_max — meaning stops arrive sooner. There is no free
+fill-rate.
+
+---
+
 ## 8. What I'd instrument from day one
 
 Since the stated goal is to see the mechanics, log these per basket cycle — they are what make
