@@ -457,6 +457,121 @@ fill-rate.
 
 ---
 
+## 7d. The 0.02-lot / 2.5-pip "aggressive scalping" question
+
+The proposal: double lots to 0.02 so a **2.5-pip** move pays the same 50 cents,
+on the reasoning that half the distance is reached twice as often.
+
+### The lot half of the idea is economically empty
+
+Doubling the lot doubles the profit, the loss, **and the commission**, all by the
+same factor. It is pure leverage. `compare_presets.py --self-test` asserts this
+and it holds to machine precision:
+
+```
+lots=0.01  RATIO=0.232231   GBP/wk=-10.129
+lots=0.02  RATIO=0.232231   GBP/wk=-20.257
+lots=0.04  RATIO=0.232231   GBP/wk=-40.514
+RATIO spread 0.00e+00 -> PASS
+```
+
+RATIO is unchanged; only the currency scales. So the lot has **no bearing** on
+whether the strategy works — it only decides how fast the answer arrives.
+
+The reason this matters: pairing "0.02 lots" with "2.5 pips" holds the *dollar*
+target at 50c and thereby **hides** the thing that did change. Commission is
+~0.505 pips round-trip **regardless of lot size**, so:
+
+| | TP | cost ratio | net per cycle |
+|---|---|---|---|
+| conservative | 5.0p | **10.1%** | 4.50 pips |
+| aggressive | 2.5p | **20.2%** | 2.00 pips |
+
+The broker's share of gross income **doubles**. The 50-cent figure is a
+psychological anchor, not an economic one.
+
+### The distance half is a real trade-off, and it measures worse
+
+On a scale-invariant random walk the "twice as often" intuition is nearly
+correct — halving all distances rescales time by 1/λ² and leaves TPs-per-stop
+unchanged. Three things break that symmetry, all of them fixed in pips:
+commission, slippage/gaps, and the fact that D_max stops being an outlier.
+
+12 seeds × 3 years, both presets driven by the **same M1 path** (so any
+difference is geometry, not luck):
+
+| preset | TP/wk | stops/wk | win% | TPs/stop | cost (TPs) | RATIO |
+|---|---|---|---|---|---|---|
+| conservative M15 | 18.8 | 2.45 | 88.5 | 7.7 | 22.7 | **0.34** |
+| aggressive M5 | 18.6 | **4.43** | 80.7 | 4.2 | 18.2 | **0.23** |
+
+RATIO spread was tight in both (conservative 0.32–0.35, aggressive 0.22–0.24).
+
+**The headline is the first two columns. Take-profits per week did not rise at
+all (18.8 → 18.6), while stop-outs nearly doubled.** The core premise — more
+fills — did not materialise, because each stop-out costs a 24h cooldown and at
+4.43 stops/week the EA is flat ~88% of the time.
+
+Trade frequency *can* be bought by shortening the cooldown (at 2h it rises to
+~114 TP/week) — but RATIO stays pinned at 0.23 across every variant tested.
+**Frequency is a free parameter; RATIO is not.** Turning the handle faster on a
+zero-expectancy bet changes only the variance.
+
+### Why D_max = 15 pips is the deepest problem
+
+`basket_mult 6 × 2.5 = 15 pips`. §4 chose a displacement stop specifically so it
+would sit *outside* normal noise and fire rarely. A 15-pip EUR/USD excursion is
+a routine half-hour, not a tail event: adverse moves scale roughly as 1/D², so
+15-pip moves arrive **~7.8× more often** than the 42-pip moves the conservative
+geometry tolerates. The basket stop stops being insurance and becomes a
+running cost — visible directly as stops/week 2.45 → 4.43.
+
+The 6% equity stop offers no help here. At 0.02 lots on £500 it needs ~190 raw
+pips of adverse movement, against a typical stop loss of ~38 pips. **It is inert
+below ~0.10 lots** — the displacement stop is the only thing actually protecting
+the account.
+
+### Three code-level defects this configuration exposed
+
+All fixed; the first would have silently invalidated the whole test.
+
+1. **Re-anchor churn.** The stale-anchor rule fired when SMA(20) drifted more
+   than *one spacing*. At 2.5 pips on M5 that is a several-times-per-hour event,
+   so the EA would have withdrawn its own ladder before it could fill — a milder
+   rerun of the v1 bug (§7b). Added `InpReanchorMult`; the aggressive presets use
+   3.0. `InpSpacingMinPips <= 4.0` with `InpReanchorMult <= 1.0` now warns at init.
+2. **Broker minimum stop distance.** A 2.5-pip TP is 25 points. Any broker with
+   a non-zero `SYMBOL_TRADE_STOPS_LEVEL` rejects every such order. Harmless at
+   5 pips, fatal at 2.5. `OnInit` now fails with `INIT_PARAMETERS_INCORRECT`
+   rather than emitting thousands of silent order errors.
+3. **Timeframe-dependent cooldown.** `InpCooldownBars=96` is 24h on M15 but 8h
+   on M5 and 1.6h on M1. Comparing presets in bars would have handed the
+   aggressive one a 3× shorter cooldown and made the comparison meaningless.
+   Added `InpCooldownMins` (absolute, takes precedence when > 0).
+
+Also: with `ATRMult = 1.0` and a 2.5-pip floor, spacing is **pinned at the
+floor** on M5/M1 — volatility adaptation is off, so the grid cannot widen in
+fast markets, exactly when widening is what saves it. `OnInit` now warns.
+
+And a unit bug in the *analysis* code, worth recording because it produced a
+plausible-looking wrong answer: `harvester.py` accounts P&L in 0.01-lot-
+equivalent pips, but the basket-stop branch subtracted exit cost in raw pips.
+That made RATIO appear to *degrade with lot size* (0.23 → 0.12), which is
+impossible for a pure pip ratio. Fixed, and now guarded by a self-test.
+
+### Verdict
+
+Worth running as an experiment, since the mechanics are the stated goal — the
+presets are in `mql5/presets/`. But the prediction on record is: **a higher win
+rate, a smoother early equity curve, and a worse RATIO.** That combination is
+the optional-stopping signature from `micro-harvest-verdict.md` §1, and 2.5 pips
+is halfway back to the 1–2 pip target that document rejected. If the tester
+returns 95%+ wins and zero stops over a short window, that is not a result —
+it is the same "before the first stop-out" picture as v2, with the loss now
+arriving roughly twice as often.
+
+---
+
 ## 8. What I'd instrument from day one
 
 Since the stated goal is to see the mechanics, log these per basket cycle — they are what make

@@ -38,12 +38,14 @@ input double InpSpacingMaxPips  = 15.0;   // Spacing ceiling
 input double InpWiden           = 0.25;   // Gap k = s*(1+Widen*(k-1))
 input int    InpMaxLevels       = 3;      // Ladder depth (3 = measured optimum)
 input int    InpPrePlaceLevels  = 2;      // Pendings resting on server at once
+input double InpReanchorMult    = 1.0;    // Re-anchor when SMA drifts > Mult x spacing
 
 input group           "=== Basket stop ==="
 input double InpBasketMult      = 6.0;    // Stop at |price-anchor| > Mult x spacing
 input double InpEquityStopPct   = 6.0;    // Also stop at this % of equity lost
 input double InpDisasterMult    = 2.0;    // Per-position SL = Mult x D_max
 input int    InpCooldownBars    = 96;     // Bars flat after a basket stop
+input int    InpCooldownMins    = 0;      // If >0, use MINUTES not bars (TF-proof)
 
 input group           "=== Regime gate / filters ==="
 input int    InpAnchorMA        = 20;     // SMA period (anchor + BB basis)
@@ -668,6 +670,52 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
+   // ---- Broker minimum distances ------------------------------------------
+   // At a 5-pip TP this never mattered. At 2.5 pips it does: the attached TP
+   // is only 25 points away, and any broker with a non-zero stops level will
+   // REJECT the order outright. Fail loudly at init rather than logging
+   // thousands of silent order errors during a test.
+   long   stopLvl   = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long   freezeLvl = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double tpPoints  = InpTPPips * (g_pip / _Point);
+   if(stopLvl > 0 && tpPoints <= (double)stopLvl)
+   {
+      PrintFormat("ERROR: TP %.1f pips = %.0f points, but broker "
+                  "SYMBOL_TRADE_STOPS_LEVEL = %d points. Every order would be "
+                  "rejected. Raise InpTPPips above %.1f pips.",
+                  InpTPPips, tpPoints, (int)stopLvl,
+                  (double)stopLvl / (g_pip / _Point));
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(freezeLvl > 0)
+      PrintFormat("NOTE: broker freeze level = %d points. Orders closer than "
+                  "this to market cannot be modified or cancelled.",
+                  (int)freezeLvl);
+
+   // ---- Is ATR adaptation actually alive? ---------------------------------
+   // Spacing = clip(ATRMult x ATR, min, max). If ATRMult x typical ATR sits
+   // below the floor, spacing is PINNED at the floor and the grid can no
+   // longer widen in fast markets -- losing the one mechanism that protects
+   // it exactly when protection is needed. v1 ran pinned at 7.0p all week.
+   if(InpATRMult <= 1.0)
+      PrintFormat("WARNING: InpATRMult=%.2f is low. On M1/M5 this will pin "
+                  "spacing at the %.1fp floor, disabling volatility "
+                  "adaptation. The grid will NOT widen when it should.",
+                  InpATRMult, InpSpacingMinPips);
+   if(InpSpacingMaxPips < 2.0 * InpSpacingMinPips)
+      PrintFormat("NOTE: spacing range [%.1f..%.1f] is narrow (%.2fx). "
+                  "Little room for ATR to act.",
+                  InpSpacingMinPips, InpSpacingMaxPips,
+                  InpSpacingMaxPips / InpSpacingMinPips);
+
+   // Tight grids need a re-anchor threshold wider than one spacing, or the
+   // ladder is withdrawn before it can fill (see OnTick section 4).
+   if(InpSpacingMinPips <= 4.0 && InpReanchorMult <= 1.0)
+      PrintFormat("WARNING: spacing floor %.1fp with InpReanchorMult=%.2f. "
+                  "The SMA drifts one spacing very often at this scale, so "
+                  "the ladder will churn. Use InpReanchorMult >= 2.0.",
+                  InpSpacingMinPips, InpReanchorMult);
+
    // Deepest level must sit well inside the basket stop, or it is decorative.
    double deepest = LevelDepthPips(InpMaxLevels, InpSpacingMinPips);
    double dmax    = DMaxPips(InpSpacingMinPips);
@@ -700,6 +748,29 @@ int OnInit()
                "spacing=[%.1f..%.1f] | D_max=%.1fx | preplace=%d",
                g_pip, InpTPPips, InpMaxLevels, InpSpacingMinPips,
                InpSpacingMaxPips, InpBasketMult, InpPrePlaceLevels);
+
+   // Cost ratio is the single most important number and it depends ONLY on the
+   // TP in pips -- never on lot size, because commission scales with lots at
+   // exactly the same rate as profit does. Print it so it cannot be forgotten.
+   // 0.505 pips/round-trip was measured from a real tester report (v2:
+   // GBP0.56 commission / 14 trades / GBP0.07914 per pip at 0.01 lot).
+   double costPips  = 0.505;
+   double costRatio = 100.0 * costPips / InpTPPips;
+   PrintFormat("COST RATIO = %.1f%%  (%.3f pips round-trip / %.1f pip TP). "
+               "LOT SIZE DOES NOT CHANGE THIS.", costRatio, costPips,
+               InpTPPips);
+   if(costRatio > 15.0)
+      PrintFormat("WARNING: %.0f%% of gross income is being paid to the broker. "
+                  "At a %.1f pip TP you keep only %.2f pips per cycle.",
+                  costRatio, InpTPPips, InpTPPips - costPips);
+
+   double lossAtStop = 0.0;
+   for(int k = 1; k <= InpMaxLevels; k++)
+      lossAtStop += dmax - LevelDepthPips(k, InpSpacingMinPips);
+   PrintFormat("RISK GEOMETRY @ floor spacing: D_max=%.1fp | aggregate loss if "
+               "all %d levels open at the stop = %.1fp = %.1f winning cycles",
+               dmax, InpMaxLevels, lossAtStop,
+               lossAtStop / (InpTPPips - costPips));
    PrintFormat("Ladder depths @ spacing 10p: L1=%.1f L2=%.1f L3=%.1f | D_max=%.1f",
                LevelDepthPips(1, 10.0), LevelDepthPips(2, 10.0),
                LevelDepthPips(3, 10.0), DMaxPips(10.0));
@@ -790,8 +861,13 @@ void OnTick()
          g_state        = HS_COOLDOWN;
          g_anchor       = 0.0;
          g_spacing      = 0.0;
-         g_cooldownTill = barT + (datetime)(InpCooldownBars *
-                          PeriodSeconds(PERIOD_CURRENT));
+         // Prefer an absolute duration when given. "96 bars" means 24h on
+         // M15 but only 8h on M5 and 1.6h on M1, which would silently make
+         // a lower-timeframe preset far more aggressive than the one it is
+         // being compared against.
+         g_cooldownTill = barT + (datetime)(InpCooldownMins > 0
+                          ? InpCooldownMins * 60
+                          : InpCooldownBars * PeriodSeconds(PERIOD_CURRENT));
          SaveState();
          return;
       }
@@ -844,15 +920,24 @@ void OnTick()
          double maNow;
          if(ReadBuf(hMA, 0, maNow))
          {
+            // The threshold is a MULTIPLE of spacing, not spacing itself.
+            // With a 2.5-pip scalping spacing, a bare `> g_spacing` test
+            // fires on 2.5 pips of SMA(20) drift, which on M5 happens
+            // several times an hour -- re-creating a milder version of the
+            // v1 self-cancellation bug. Raise InpReanchorMult for tight
+            // grids so the ladder is given time to actually fill.
             double driftPips = MathAbs(maNow - g_anchor) / g_pip;
-            if(driftPips > g_spacing)
+            double driftTrig = InpReanchorMult * g_spacing;
+            if(driftPips > driftTrig)
             {
                CancelAllPendings();
                CloseCycle("reanchor_drift", driftPips, 0.0);
                g_state  = HS_FLAT;
                g_anchor = 0.0;
-               Log(StringFormat("anchor stale: SMA drifted %.1fp > spacing "
-                                "%.1fp -> re-anchoring", driftPips, g_spacing));
+               Log(StringFormat("anchor stale: SMA drifted %.1fp > %.1fp "
+                                "(%.2f x spacing %.1fp) -> re-anchoring",
+                                driftPips, driftTrig, InpReanchorMult,
+                                g_spacing));
                SaveState();
             }
          }

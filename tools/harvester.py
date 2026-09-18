@@ -76,6 +76,11 @@ class Params:
     cooldown_bars: int = 96         # after a basket stop (96 M15 = 1 day)
     lots_per_level: float = 0.01
 
+    # --- account ------------------------------------------------------------
+    # Reference equity for the % equity stop. Used to convert equity_stop_pct
+    # into the 0.01-lot-equivalent pips that the engine accounts in.
+    start_equity_usd: float = 1000.0
+
     # --- costs (your broker) -----------------------------------------------
     commission_pips_per_side: float = 0.20
     spread_pips: float = 0.10
@@ -220,7 +225,7 @@ def run_harvester(close: np.ndarray, p: Params, verbose: bool = False) -> Stats:
     depths: list[float] = []
     cooldown = 0
     cycle_entries = 0        # fills in the CURRENT cycle (see release guard)
-    start_equity_pips = 1000.0 / USD_PER_PIP_PER_MICROLOT   # $1000 reference
+    start_equity_pips = p.start_equity_usd / USD_PER_PIP_PER_MICROLOT
 
     for i in range(n):
         price = px[i]
@@ -308,8 +313,14 @@ def run_harvester(close: np.ndarray, p: Params, verbose: bool = False) -> Stats:
         equity_trip = -p.equity_stop_pct * start_equity_pips
         if positions and (abs(dist) > d_max or unreal <= equity_trip):
             held = len(positions)
-            st.realized_pips += unreal - p.cost_market_exit * held
-            st.stop_losses_pips.append(unreal - p.cost_market_exit * held)
+            # UNIT CONSISTENCY: `unreal` is in 0.01-lot-EQUIVALENT pips (it is
+            # scaled by size/0.01 above), and the take-profit branch scales its
+            # cost the same way. The exit cost must therefore also be weighted
+            # by position size, or it is under-counted whenever lots != 0.01.
+            exit_cost = p.cost_market_exit * sum(q.size / 0.01
+                                                 for q in positions.values())
+            st.realized_pips += unreal - exit_cost
+            st.stop_losses_pips.append(unreal - exit_cost)
             st.n_basket_stops += 1
             if verbose:
                 print(f"  bar {i}: BASKET STOP  dist={dist:+.1f}p "
