@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# market data — keep large CSVs out of git
+*.csv
+*.hst
+*.fxt
+data/
+
+# MT5 build artefacts
+*.ex5
+
+.DS_Store
+.idea/
+.vscode/
