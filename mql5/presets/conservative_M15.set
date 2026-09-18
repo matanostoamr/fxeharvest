@@ -1,0 +1,42 @@
+; Harvester5Pip -- CONSERVATIVE preset  (the v2 baseline)
+; Attach to EUR/USD, timeframe M15.
+;
+; This is the configuration that produced the validated v2 tester report:
+;   14 trades, 15.9% fill rate, cost ratio 10.1%, zero basket stops.
+; Measured RATIO on zero-edge synthetic data: 0.34  (needs >1.0 for edge)
+;
+; Magic 770501 -- keep DIFFERENT from the aggressive preset so the two runs
+; never adopt each other's orders.
+;
+InpTPPips=5.0
+InpLotsPerLevel=0.01
+InpATRMult=2.0
+InpSpacingMinPips=7.0
+InpSpacingMaxPips=15.0
+InpWiden=0.25
+InpMaxLevels=3
+InpPrePlaceLevels=2
+InpReanchorMult=1.0
+InpBasketMult=6.0
+InpEquityStopPct=6.0
+InpDisasterMult=2.0
+InpCooldownBars=96
+InpCooldownMins=1440
+InpAnchorMA=20
+InpATRPeriod=20
+InpERWindow=20
+InpERFull=0.35
+InpERHalf=0.50
+InpRSIPeriod=14
+InpRSILongVeto=25.0
+InpRSIShortVeto=75.0
+InpBWExpansionMult=1.6
+InpBWMedianBars=50
+InpRolloverMins=5
+InpFlatOnFriday=true
+InpFridayCloseHour=20
+InpMagic=770501
+InpSlippagePoints=10
+InpVerboseLog=true
+InpCsvLog=true
+InpCsvCommonFolder=false

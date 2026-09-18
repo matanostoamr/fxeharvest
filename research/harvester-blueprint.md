@@ -335,6 +335,243 @@ Useful reference numbers from the 3-year synthetic run (mechanics validation):
 
 ---
 
+## 7b. Field notes from the first real-tick backtest
+
+Pepperstone UK demo, EUR/USD M15, 2026.08.27–09.02, 100% real ticks (311,511 ticks,
+384 bars), £500 @ 1:30. Short sample, but it settled several things.
+
+**Geometry verified against the broker's own order records.** Reverse-engineering
+anchor and spacing from the placed order prices gives spacing **7.04 pips** (the
+`InpSpacingMinPips` floor, so ATR20(M15) was under 3.5 pips that week) and anchor
+**1.16519**. Every level, take-profit and stop matched spec to **under 0.5 pip**:
+
+| | Broker | Spec | Diff |
+|---|---|---|---|
+| buy L1 | 1.16449 | 1.16449 | 0.00p |
+| buy L2 | 1.16361 | 1.16361 | 0.00p |
+| sell L1 | 1.16589 | 1.16590 | 0.08p |
+| sell L2 | 1.16676 | 1.16678 | 0.18p |
+| buy L1 TP | 1.16499 | 1.16499 | 0.00p |
+| buy L1 SL | 1.15609 | 1.15604 | 0.48p |
+
+**Cost model confirmed.** The single completed trade: gross £0.37, commission £0.04,
+net £0.33 — a **10.8% cost ratio** against the 10.0% predicted in §0. The cost
+arithmetic in this document can be trusted.
+
+**One bug, and it was severe.** 1,053 pending orders placed, **1 filled — a 0.095%
+fill rate.** Cause: the "book emptied → re-anchor" branch keyed on
+`state==ACTIVE && positions==0`, which is *also* true in the instant after arming,
+before anything has been touched. The EA withdrew its own ladder on the next tick,
+re-armed on the next bar, and repeated. A resting limit cannot fill if it is
+cancelled milliseconds after placement. Fixed by gating that branch on
+`entries_this_cycle > 0`, plus a stale-anchor rule: re-anchor only when the SMA has
+drifted more than one spacing from the frozen anchor.
+
+**Lesson worth generalising:** the failure was invisible in aggregate P&L (+£0.33,
+100% win rate, profit factor 17.5 — superficially fine). It was only visible in the
+**order-to-fill ratio**. Watch that number from the first run.
+
+**Simulator realism gap.** `harvester.py` fills a level the moment price is beyond
+it; MT5 requires the order to be *resting* when price arrives. The Python model is
+therefore optimistic on trade frequency — treat its fill counts as an upper bound,
+not a forecast.
+
+**Also observed:** the one fill took **6h10m** to capture 5 pips, and zero basket
+stops fired in the week. Both are single-sample facts, not evidence of anything.
+
+---
+
+## 7c. Field notes — v2, after the self-cancellation fix
+
+Same broker, same instrument, same week, same inputs (EUR/USD M15, 2026.08.27–09.02,
+384 bars, 100% real ticks, £500 @ 1:30). Only the section-4 gating changed.
+
+**The fix worked, and the size of the effect is the whole story.**
+
+| | v1 | v2 |
+|---|---|---|
+| pendings placed | 1,053 | 88 |
+| pendings filled | 1 | 14 |
+| fill rate | 0.095% | **15.9%** |
+| net | +£0.33 | +£5.00 |
+| profit factor | 17.5 | 18.86 |
+
+A **168× improvement in order-to-fill ratio.** Note also that v2 placed *fewer*
+orders (88 vs 1,053) — v1's order count was almost entirely churn, the same ladder
+being re-posted after cancelling itself.
+
+**Cost model confirmed a third time.** Commission £0.56 against gross £5.54 = a
+**10.1% cost ratio**, versus 10.0% predicted in §0. Three independent measurements
+now (10.8%, 10.1%, 10.0% modelled). The cost arithmetic is settled; stop re-deriving it.
+
+**Geometry still exact at non-floor spacing.** v1 only ever ran at the 7.0-pip floor.
+v2 saw ATR-driven spacing up to **11.44 pips**, and the geometry held: order 21's stop
+at 1.18101 is exactly 2 × D_max (68.6 pips) from its anchor, per §4.
+
+**The headline numbers are meaningless, and it matters that you know why.**
+100% win rate. Profit factor 18.86. Sharpe 7.74. LR Correlation 1.00. Max equity
+drawdown 0.33%. This is not a good result — it is **what every grid looks like
+immediately before its first stop-out.** Zero basket stops fired. The loss
+distribution has not been sampled at all, so every ratio above is computed from a
+truncated sample and is upward-biased by an unknown amount.
+
+**The number that decides viability, quantified.** From the measured £0.0791/pip
+(0.01 lot) and the 7-pip geometry:
+
+- level depths from anchor: 7.00 / 15.75 / 26.25 pips; D_max = 6 × 7 = 42 pips
+- aggregate adverse excursion at the stop: 35.0 + 26.25 + 15.75 = **77.0 pips = £6.09**
+- net per winning cycle: £5.00 / 14 = **£0.357**
+- → **17.1 winning cycles are needed to pay for one basket stop**
+
+The week banked £5.00 = **0.82 stop-outs' worth of profit.** At 14 cycles/week,
+break-even requires basket stops to be rarer than **once every 1.22 weeks**. That is
+the entire question, and one week cannot answer it.
+
+**RATIO is still undefined.** RATIO = (TPs per stop-out) / (stop-out cost in TP units)
+needs a stop-out in the denominator. Zero fired. On zero-edge synthetic data RATIO sits
+at ~0.35 (stable 0.31–0.39 across all 64 geometry combinations from §6); real data must
+show **> 1.0**. Until a sample contains stop-outs, the strategy is untested — not
+promising, not broken. Untested.
+
+**A slippage warning hiding in the deal list.** Deal 7 entered 1.16589 and exited
+1.16509 — **8 pips captured on a 5-pip target, in 3 seconds**, +£0.59 instead of
+£0.40. That is a gap through the TP in our favour. The same mechanism runs the other
+way on the basket stop, which is a *market* order by design (§1). Do not read
+favourable gaps as edge; read them as evidence that gaps happen.
+
+**Hold times are wide:** min 0:00:03, max 15:54:57, mean 3:45:06. A cycle can sit
+open across a session boundary, which is what `InpFlatOnFriday` and the rollover
+blackout exist for.
+
+**What the sample cannot support:** 384 bars is roughly 4.5 trading days. Any
+statement about expectancy, drawdown or win rate from this run is noise. The minimum
+useful sample is **2+ years of M15 real ticks**, chosen because it must contain the
+regimes that produce stop-outs (trend bursts, gap opens, event days) — not because
+two years is a round number.
+
+**If fills stay sparse** at 15.9%, the only honest lever is lowering
+`InpSpacingMinPips` toward 5, which immediately re-opens the cost-ratio trade-off
+argued in §1 of `micro-harvest-verdict.md`. Tighter spacing buys trade frequency with
+cost ratio and with a smaller D_max — meaning stops arrive sooner. There is no free
+fill-rate.
+
+---
+
+## 7d. The 0.02-lot / 2.5-pip "aggressive scalping" question
+
+The proposal: double lots to 0.02 so a **2.5-pip** move pays the same 50 cents,
+on the reasoning that half the distance is reached twice as often.
+
+### The lot half of the idea is economically empty
+
+Doubling the lot doubles the profit, the loss, **and the commission**, all by the
+same factor. It is pure leverage. `compare_presets.py --self-test` asserts this
+and it holds to machine precision:
+
+```
+lots=0.01  RATIO=0.232231   GBP/wk=-10.129
+lots=0.02  RATIO=0.232231   GBP/wk=-20.257
+lots=0.04  RATIO=0.232231   GBP/wk=-40.514
+RATIO spread 0.00e+00 -> PASS
+```
+
+RATIO is unchanged; only the currency scales. So the lot has **no bearing** on
+whether the strategy works — it only decides how fast the answer arrives.
+
+The reason this matters: pairing "0.02 lots" with "2.5 pips" holds the *dollar*
+target at 50c and thereby **hides** the thing that did change. Commission is
+~0.505 pips round-trip **regardless of lot size**, so:
+
+| | TP | cost ratio | net per cycle |
+|---|---|---|---|
+| conservative | 5.0p | **10.1%** | 4.50 pips |
+| aggressive | 2.5p | **20.2%** | 2.00 pips |
+
+The broker's share of gross income **doubles**. The 50-cent figure is a
+psychological anchor, not an economic one.
+
+### The distance half is a real trade-off, and it measures worse
+
+On a scale-invariant random walk the "twice as often" intuition is nearly
+correct — halving all distances rescales time by 1/λ² and leaves TPs-per-stop
+unchanged. Three things break that symmetry, all of them fixed in pips:
+commission, slippage/gaps, and the fact that D_max stops being an outlier.
+
+12 seeds × 3 years, both presets driven by the **same M1 path** (so any
+difference is geometry, not luck):
+
+| preset | TP/wk | stops/wk | win% | TPs/stop | cost (TPs) | RATIO |
+|---|---|---|---|---|---|---|
+| conservative M15 | 18.8 | 2.45 | 88.5 | 7.7 | 22.7 | **0.34** |
+| aggressive M5 | 18.6 | **4.43** | 80.7 | 4.2 | 18.2 | **0.23** |
+
+RATIO spread was tight in both (conservative 0.32–0.35, aggressive 0.22–0.24).
+
+**The headline is the first two columns. Take-profits per week did not rise at
+all (18.8 → 18.6), while stop-outs nearly doubled.** The core premise — more
+fills — did not materialise, because each stop-out costs a 24h cooldown and at
+4.43 stops/week the EA is flat ~88% of the time.
+
+Trade frequency *can* be bought by shortening the cooldown (at 2h it rises to
+~114 TP/week) — but RATIO stays pinned at 0.23 across every variant tested.
+**Frequency is a free parameter; RATIO is not.** Turning the handle faster on a
+zero-expectancy bet changes only the variance.
+
+### Why D_max = 15 pips is the deepest problem
+
+`basket_mult 6 × 2.5 = 15 pips`. §4 chose a displacement stop specifically so it
+would sit *outside* normal noise and fire rarely. A 15-pip EUR/USD excursion is
+a routine half-hour, not a tail event: adverse moves scale roughly as 1/D², so
+15-pip moves arrive **~7.8× more often** than the 42-pip moves the conservative
+geometry tolerates. The basket stop stops being insurance and becomes a
+running cost — visible directly as stops/week 2.45 → 4.43.
+
+The 6% equity stop offers no help here. At 0.02 lots on £500 it needs ~190 raw
+pips of adverse movement, against a typical stop loss of ~38 pips. **It is inert
+below ~0.10 lots** — the displacement stop is the only thing actually protecting
+the account.
+
+### Three code-level defects this configuration exposed
+
+All fixed; the first would have silently invalidated the whole test.
+
+1. **Re-anchor churn.** The stale-anchor rule fired when SMA(20) drifted more
+   than *one spacing*. At 2.5 pips on M5 that is a several-times-per-hour event,
+   so the EA would have withdrawn its own ladder before it could fill — a milder
+   rerun of the v1 bug (§7b). Added `InpReanchorMult`; the aggressive presets use
+   3.0. `InpSpacingMinPips <= 4.0` with `InpReanchorMult <= 1.0` now warns at init.
+2. **Broker minimum stop distance.** A 2.5-pip TP is 25 points. Any broker with
+   a non-zero `SYMBOL_TRADE_STOPS_LEVEL` rejects every such order. Harmless at
+   5 pips, fatal at 2.5. `OnInit` now fails with `INIT_PARAMETERS_INCORRECT`
+   rather than emitting thousands of silent order errors.
+3. **Timeframe-dependent cooldown.** `InpCooldownBars=96` is 24h on M15 but 8h
+   on M5 and 1.6h on M1. Comparing presets in bars would have handed the
+   aggressive one a 3× shorter cooldown and made the comparison meaningless.
+   Added `InpCooldownMins` (absolute, takes precedence when > 0).
+
+Also: with `ATRMult = 1.0` and a 2.5-pip floor, spacing is **pinned at the
+floor** on M5/M1 — volatility adaptation is off, so the grid cannot widen in
+fast markets, exactly when widening is what saves it. `OnInit` now warns.
+
+And a unit bug in the *analysis* code, worth recording because it produced a
+plausible-looking wrong answer: `harvester.py` accounts P&L in 0.01-lot-
+equivalent pips, but the basket-stop branch subtracted exit cost in raw pips.
+That made RATIO appear to *degrade with lot size* (0.23 → 0.12), which is
+impossible for a pure pip ratio. Fixed, and now guarded by a self-test.
+
+### Verdict
+
+Worth running as an experiment, since the mechanics are the stated goal — the
+presets are in `mql5/presets/`. But the prediction on record is: **a higher win
+rate, a smoother early equity curve, and a worse RATIO.** That combination is
+the optional-stopping signature from `micro-harvest-verdict.md` §1, and 2.5 pips
+is halfway back to the 1–2 pip target that document rejected. If the tester
+returns 95%+ wins and zero stops over a short window, that is not a result —
+it is the same "before the first stop-out" picture as v2, with the loss now
+arriving roughly twice as often.
+
+---
+
 ## 8. What I'd instrument from day one
 
 Since the stated goal is to see the mechanics, log these per basket cycle — they are what make

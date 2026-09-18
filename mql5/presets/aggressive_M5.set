@@ -1,0 +1,67 @@
+; Harvester5Pip -- AGGRESSIVE SCALPING preset
+; Attach to EUR/USD, timeframe M5.
+;
+; WHAT IS DIFFERENT FROM THE REQUESTED VALUES, AND WHY
+; ---------------------------------------------------
+; Requested: TP 2.5 / lots 0.02 / spacing_min 2.5 / ATRMult 1.0.  All four are
+; set as requested. Three SUPPORTING values had to change or the test would
+; measure a bug instead of the idea:
+;
+;  1. InpReanchorMult 1.0 -> 3.0
+;     The re-anchor rule fires when SMA(20) drifts more than Mult x spacing.
+;     At spacing 2.5p on M5 that is a 2.5-pip drift, which happens several
+;     times an hour -- so the EA would cancel its own resting ladder before it
+;     could fill. That is a milder rerun of the v1 bug that gave a 0.095% fill
+;     rate. 3.0 x 2.5 = 7.5 pips gives the ladder room to work.
+;
+;  2. InpSpacingMaxPips 15.0 -> 6.0
+;     With ATRMult 1.0 the ceiling is unreachable anyway; 6.0 keeps the
+;     geometry honest and makes the pinning obvious in the log.
+;
+;  3. InpCooldownMins 1440 (absolute), NOT InpCooldownBars
+;     96 bars is 24h on M15 but only 8h on M5. Leaving it in bars would hand
+;     this preset a 3x shorter cooldown and make the comparison meaningless.
+;
+; MEASURED EXPECTATION (zero-edge synthetic, 12 seeds x 3y, same price path)
+; ------------------------------------------------------------------------
+;   conservative : 18.8 TP/wk, 2.45 stops/wk, 88.5% win, RATIO 0.34
+;   aggressive   : 18.6 TP/wk, 4.43 stops/wk, 80.7% win, RATIO 0.23
+;
+; Note carefully: take-profits per week did NOT rise, while stop-outs nearly
+; DOUBLED. Cost ratio goes 10% -> 20%. D_max falls 42p -> 15p, which is a
+; routine EUR/USD half-hour rather than a tail event.
+;
+; Magic 770502 -- MUST differ from the conservative preset's 770501.
+;
+InpTPPips=2.5
+InpLotsPerLevel=0.02
+InpATRMult=1.0
+InpSpacingMinPips=2.5
+InpSpacingMaxPips=6.0
+InpWiden=0.25
+InpMaxLevels=3
+InpPrePlaceLevels=2
+InpReanchorMult=3.0
+InpBasketMult=6.0
+InpEquityStopPct=6.0
+InpDisasterMult=2.0
+InpCooldownBars=288
+InpCooldownMins=1440
+InpAnchorMA=20
+InpATRPeriod=20
+InpERWindow=20
+InpERFull=0.35
+InpERHalf=0.50
+InpRSIPeriod=14
+InpRSILongVeto=25.0
+InpRSIShortVeto=75.0
+InpBWExpansionMult=1.6
+InpBWMedianBars=50
+InpRolloverMins=5
+InpFlatOnFriday=true
+InpFridayCloseHour=20
+InpMagic=770502
+InpSlippagePoints=10
+InpVerboseLog=true
+InpCsvLog=true
+InpCsvCommonFolder=false
