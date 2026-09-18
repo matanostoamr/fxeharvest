@@ -14,6 +14,7 @@ mql5/     Harvester5Pip.mq5      MT5 execution engine (the deliverable)
 tools/    harvester.py           Python reference implementation + backtest + sweeps
           grid_diagnostic.py     Grid viability harness (surrogate test)
           spread_grid_lab.py     Cointegration lab (EUR/USD vs GBP/USD)
+          analyze_cycles.py      Reads the EA's CSV telemetry -> RATIO, slippage
 research/ *.md                   Design docs, critiques, evidence review
 ```
 
@@ -102,6 +103,47 @@ exist** — hence the mandatory far server-side SL on every position.
 - `OnTradeTransaction` logs **requested vs actual fill price**, so real limit slippage
   is measured rather than assumed.
 - Rollover blackout ±5 min around server midnight; optional Friday flatten.
+
+---
+
+## CSV telemetry
+
+With `InpCsvLog = true` the EA writes two files to `MQL5\Files`
+(or `Terminal\Common\Files` if `InpCsvCommonFolder = true`):
+
+**`Harvester_<SYMBOL>_<MAGIC>_deals.csv`** — one row per deal:
+
+```
+utc_time,cycle_id,event,side,level,req_price,fill_price,slip_pips,volume,profit,hold_secs
+```
+
+`event` is `ENTRY`, `TP_EXIT`, `SL_EXIT` or `STOP_EXIT`, classified from
+`DEAL_REASON`. The `req_price` / `fill_price` / `slip_pips` columns are the point of
+this file: they **measure** limit slippage instead of assuming the blueprint's 0.0.
+
+**`Harvester_<SYMBOL>_<MAGIC>_cycles.csv`** — one row per basket cycle, carrying the
+indicator snapshot taken at arm time (anchor, spacing, ATR, ER, RSI) plus the outcome
+(entries, TPs, deepest level, displacement at close, max adverse excursion, P/L, reason).
+
+Both files are opened and closed per row, so a terminal crash cannot lose buffered rows.
+
+Two columns exist where one might be expected: `realized_from_deals` and `pl_at_close`.
+On a basket stop the exit deals settle asynchronously and may arrive *after* the cycle row
+is written, so both figures are logged side by side rather than silently reconciled.
+On a clean close they should agree; on a stop, `pl_at_close` is the reliable one.
+
+### Reading the telemetry
+
+```bash
+python3 tools/analyze_cycles.py --dir "C:/.../MQL5/Files"
+```
+
+Reports, in order: the **RATIO**, measured slippage versus the assumed 0.50-pip cost,
+fills-per-level (does level 3 actually fill, or is it decorative?), outcome bucketed by
+ER at arm time, and a month-by-month table.
+
+The ER breakdown is worth watching: if average P/L does **not** fall as ER rises, the
+gate is not earning its complexity and `InpERFull` should be widened rather than tightened.
 
 ---
 

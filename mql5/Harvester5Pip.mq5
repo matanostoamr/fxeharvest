@@ -65,6 +65,10 @@ input long   InpMagic           = 770501; // Base magic number
 input int    InpSlippagePoints  = 10;     // Max deviation for market exits
 input bool   InpVerboseLog      = true;   // Log every cycle event
 
+input group           "=== CSV logging ==="
+input bool   InpCsvLog          = true;   // Write per-deal and per-cycle CSVs
+input bool   InpCsvCommonFolder = false;  // Use shared Terminal\Common\Files
+
 //====================================================================
 //  GLOBALS
 //====================================================================
@@ -86,7 +90,28 @@ double      g_pip          = 0.0;
 double      g_cycleStartEq = 0.0;
 
 // persistence keys so state survives terminal restart / recompile
-string   gvAnchor, gvSpacing, gvState, gvCooldown;
+string   gvAnchor, gvSpacing, gvState, gvCooldown, gvCycleId;
+
+//---- per-cycle telemetry (CSV logger) ------------------------------
+long     g_cycleId          = 0;
+datetime g_cycleArmTime     = 0;
+double   g_cycleAtrPips     = 0.0;   // captured at ARM
+double   g_cycleEr          = 0.0;
+double   g_cycleRsiAtArm    = 0.0;
+double   g_cycleSizeMult    = 0.0;
+int      g_cycleEntries     = 0;
+int      g_cycleTPs         = 0;
+int      g_cycleStopExits   = 0;
+int      g_cycleMaxLevel    = 0;
+double   g_cycleMaxAdvPips  = 0.0;   // worst |price-anchor| reached
+double   g_cycleMaxFloatDD  = 0.0;   // worst floating loss, account currency
+double   g_cycleRealized    = 0.0;   // realised P/L accumulated from deals
+
+// entry bookkeeping for slippage + hold time: [sideIdx][level], level 1..8
+datetime g_entryTime[2][9];
+double   g_entryReq[2][9];
+
+int SideIdx(const int side) { return (side > 0) ? 0 : 1; }
 
 //====================================================================
 //  SMALL HELPERS
@@ -137,6 +162,69 @@ void Log(const string msg)
 }
 
 //====================================================================
+//  CSV LOGGER
+//
+//  Two files, written to MQL5\Files (or Terminal\Common\Files):
+//
+//   *_deals.csv   one row per ENTRY / TP_EXIT / STOP_EXIT deal.
+//                 Carries requested vs actual fill price, so real limit
+//                 slippage is MEASURED rather than assumed to be zero.
+//
+//   *_cycles.csv  one row per basket cycle (ARM -> flat), with the
+//                 indicator snapshot taken at ARM time plus the outcome.
+//                 This is the file that yields the RATIO:
+//                     RATIO = sum(n_tp) / count(stopped cycles)
+//                             ------------------------------------
+//                             avg |realised_pl| of stopped cycles
+//                             expressed in take-profit units
+//
+//  Opened and closed per row on purpose: a terminal crash then cannot
+//  lose buffered rows. Write volume is a handful of rows per hour.
+//====================================================================
+string CsvPath(const string suffix)
+{
+   return StringFormat("Harvester_%s_%I64d_%s.csv", _Symbol, InpMagic, suffix);
+}
+
+void CsvWriteRow(const string suffix, const string header, const string row)
+{
+   if(!InpCsvLog) return;
+
+   int flags = FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI;
+   if(InpCsvCommonFolder) flags |= FILE_COMMON;
+
+   string path = CsvPath(suffix);
+   int h = FileOpen(path, flags);
+   if(h == INVALID_HANDLE)
+   {
+      PrintFormat("[HARV] CSV open failed: %s err=%d", path, GetLastError());
+      return;
+   }
+   bool isNew = (FileSize(h) == 0);
+   FileSeek(h, 0, SEEK_END);
+   if(isNew) FileWriteString(h, header + "\r\n");
+   FileWriteString(h, row + "\r\n");
+   FileClose(h);
+}
+
+void CsvLogDeal(const string event, const int side, const int level,
+                const double reqPrice, const double fillPrice,
+                const double slipPips, const double volume,
+                const double profit, const long holdSecs)
+{
+   string header = "utc_time,cycle_id,event,side,level,req_price,fill_price,"
+                   "slip_pips,volume,profit,hold_secs";
+   int dg = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   string row = StringFormat("%s,%I64d,%s,%s,%d,%s,%s,%.2f,%.2f,%.2f,%I64d",
+                  TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
+                  g_cycleId, event, (side > 0 ? "BUY" : "SELL"), level,
+                  (reqPrice > 0.0 ? DoubleToString(reqPrice, dg) : ""),
+                  DoubleToString(fillPrice, dg),
+                  slipPips, volume, profit, holdSecs);
+   CsvWriteRow("deals", header, row);
+}
+
+//====================================================================
 //  LEVEL GEOMETRY
 //  depth_k = spacing * SUM_{j=1..k} (1 + Widen*(j-1))
 //====================================================================
@@ -151,6 +239,83 @@ double LevelDepthPips(const int level, const double spacingPips)
 double DMaxPips(const double spacingPips)
 {
    return InpBasketMult * spacingPips;
+}
+
+//====================================================================
+//  CYCLE LIFECYCLE  (telemetry only -- no trading side effects)
+//====================================================================
+void StartCycle(const double atrPips, const double er,
+                const double rsiAtArm, const double sizeMult)
+{
+   g_cycleId++;
+   g_cycleArmTime    = TimeCurrent();
+   g_cycleAtrPips    = atrPips;
+   g_cycleEr         = er;
+   g_cycleRsiAtArm   = rsiAtArm;
+   g_cycleSizeMult   = sizeMult;
+   g_cycleEntries    = 0;
+   g_cycleTPs        = 0;
+   g_cycleStopExits  = 0;
+   g_cycleMaxLevel   = 0;
+   g_cycleMaxAdvPips = 0.0;
+   g_cycleMaxFloatDD = 0.0;
+   g_cycleRealized   = 0.0;
+
+   for(int s = 0; s < 2; s++)
+      for(int l = 0; l < 9; l++)
+      { g_entryTime[s][l] = 0; g_entryReq[s][l] = 0.0; }
+
+   GlobalVariableSet(gvCycleId, (double)g_cycleId);
+}
+
+//--------------------------------------------------------------------
+// plAtClose: floating P/L observed at the moment of closing. For a
+// basket stop the OUT deals settle asynchronously (they may arrive in
+// OnTradeTransaction AFTER this row is written), so both figures are
+// logged side by side rather than silently reconciled:
+//    realized_from_deals -- what had settled when the row was written
+//    pl_at_close         -- floating P/L at the close decision
+// On a natural flat the two should agree closely; on a stop, pl_at_close
+// is the reliable one and excludes exit slippage.
+//--------------------------------------------------------------------
+void CloseCycle(const string reason, const double distPips,
+                const double plAtClose)
+{
+   if(g_cycleId <= 0 || g_cycleArmTime == 0) return;   // nothing armed
+
+   string header = "cycle_id,arm_utc,close_utc,duration_secs,anchor,"
+                   "spacing_pips,atr_pips,er_at_arm,rsi_at_arm,size_mult,"
+                   "dmax_pips,n_entries,n_tp,n_stop_exits,max_level,"
+                   "dist_at_close_pips,max_adverse_pips,max_float_dd,"
+                   "realized_from_deals,pl_at_close,close_reason,equity_after";
+
+   int      dg  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   datetime now = TimeCurrent();
+
+   string row = StringFormat(
+      "%I64d,%s,%s,%I64d,%s,%.1f,%.1f,%.4f,%.1f,%.1f,%.1f,"
+      "%d,%d,%d,%d,%.1f,%.1f,%.2f,%.2f,%.2f,%s,%.2f",
+      g_cycleId,
+      TimeToString(g_cycleArmTime, TIME_DATE | TIME_SECONDS),
+      TimeToString(now, TIME_DATE | TIME_SECONDS),
+      (long)(now - g_cycleArmTime),
+      DoubleToString(g_anchor, dg),
+      g_spacing, g_cycleAtrPips, g_cycleEr, g_cycleRsiAtArm, g_cycleSizeMult,
+      DMaxPips(g_spacing),
+      g_cycleEntries, g_cycleTPs, g_cycleStopExits, g_cycleMaxLevel,
+      distPips, g_cycleMaxAdvPips, g_cycleMaxFloatDD,
+      g_cycleRealized, plAtClose, reason,
+      AccountInfoDouble(ACCOUNT_EQUITY));
+
+   CsvWriteRow("cycles", header, row);
+
+   Log(StringFormat("CYCLE %I64d closed (%s): entries=%d tp=%d stopExits=%d "
+                    "maxLvl=%d dist=%.1fp maxAdv=%.1fp pl=%.2f",
+                    g_cycleId, reason, g_cycleEntries, g_cycleTPs,
+                    g_cycleStopExits, g_cycleMaxLevel, distPips,
+                    g_cycleMaxAdvPips, plAtClose));
+
+   g_cycleArmTime = 0;   // guard against writing the same cycle twice
 }
 
 //====================================================================
@@ -454,6 +619,7 @@ void LoadState()
    if(GlobalVariableCheck(gvSpacing))  g_spacing = GlobalVariableGet(gvSpacing);
    if(GlobalVariableCheck(gvState))    g_state   = (ENUM_HSTATE)(int)GlobalVariableGet(gvState);
    if(GlobalVariableCheck(gvCooldown)) g_cooldownTill = (datetime)GlobalVariableGet(gvCooldown);
+   if(GlobalVariableCheck(gvCycleId))  g_cycleId = (long)GlobalVariableGet(gvCycleId);
 
    // Reconcile with the actual book -- the book is the truth.
    int nPos = CountOurPositions();
@@ -488,6 +654,7 @@ int OnInit()
    gvSpacing  = "HARV_" + _Symbol + "_SPACING_"  + (string)InpMagic;
    gvState    = "HARV_" + _Symbol + "_STATE_"    + (string)InpMagic;
    gvCooldown = "HARV_" + _Symbol + "_COOLDOWN_" + (string)InpMagic;
+   gvCycleId  = "HARV_" + _Symbol + "_CYCLEID_"  + (string)InpMagic;
 
    if(InpMaxLevels < 1 || InpMaxLevels > 8)
    {
@@ -575,7 +742,13 @@ void OnTick()
    if(FridayFlattenTime())
    {
       if(CountOurPendings() > 0) CancelAllPendings();
-      if(nPos > 0) CloseAllPositions("friday flatten");
+      if(nPos > 0)
+      {
+         double fPL  = BasketFloatingPL();
+         double dPip = (g_anchor > 0.0) ? MathAbs(mid - g_anchor) / g_pip : 0.0;
+         CloseAllPositions("friday flatten");
+         CloseCycle("friday_flatten", dPip, fPL);
+      }
       g_state  = HS_FLAT;
       g_anchor = 0.0;
       SaveState();
@@ -596,6 +769,10 @@ void OnTick()
                         * ((g_cycleStartEq > 0.0) ? g_cycleStartEq
                            : AccountInfoDouble(ACCOUNT_EQUITY));
 
+      // --- per-cycle telemetry: track the worst excursion reached -------
+      if(distPips > g_cycleMaxAdvPips) g_cycleMaxAdvPips = distPips;
+      if(floatPL  < g_cycleMaxFloatDD) g_cycleMaxFloatDD = floatPL;
+
       bool hitDisp = (distPips > dmax);
       bool hitEq   = (floatPL <= eqTrip);
 
@@ -607,6 +784,8 @@ void OnTick()
                           hitDisp ? "displacement" : "equity"));
          CancelAllPendings();
          CloseAllPositions(hitDisp ? "basket displacement" : "basket equity");
+         CloseCycle(hitDisp ? "basket_displacement" : "basket_equity",
+                    distPips, floatPL);
 
          g_state        = HS_COOLDOWN;
          g_anchor       = 0.0;
@@ -638,6 +817,8 @@ void OnTick()
    if(g_state == HS_ACTIVE && nPos == 0)
    {
       if(CountOurPendings() > 0) CancelAllPendings();
+      double dPip = (g_anchor > 0.0) ? MathAbs(mid - g_anchor) / g_pip : 0.0;
+      CloseCycle("all_tp_closed", dPip, g_cycleRealized);
       g_state  = HS_FLAT;
       g_anchor = 0.0;
       Log("basket closed out -> FLAT (anchor released, will re-arm)");
@@ -661,9 +842,10 @@ void OnTick()
       if(s_sizeMult <= 0.0) return;
       if(InRolloverBlackout()) return;
 
-      double ma, atr;
+      double ma, atr, rsiArm = 0.0;
       if(!ReadBuf(hMA, 0, ma))  return;
       if(!ReadBuf(hATR, 0, atr)) return;
+      ReadBuf(hRSI, 0, rsiArm);   // telemetry only; not a gate here
 
       double atrPips = atr / g_pip;
       double spacing = InpATRMult * atrPips;
@@ -674,10 +856,12 @@ void OnTick()
       g_cycleStartEq = AccountInfoDouble(ACCOUNT_EQUITY);
       g_state        = HS_ACTIVE;
 
-      Log(StringFormat("ARM  anchor=%.5f  spacing=%.1fp  ATR=%.1fp  ER=%.3f  "
-                       "size=%.1f  D_max=%.1fp",
-                       g_anchor, g_spacing, atrPips, s_er, s_sizeMult,
-                       DMaxPips(g_spacing)));
+      StartCycle(atrPips, s_er, rsiArm, s_sizeMult);
+
+      Log(StringFormat("ARM cycle %I64d  anchor=%.5f  spacing=%.1fp  ATR=%.1fp  "
+                       "ER=%.3f  RSI=%.1f  size=%.1f  D_max=%.1fp",
+                       g_cycleId, g_anchor, g_spacing, atrPips, s_er, rsiArm,
+                       s_sizeMult, DMaxPips(g_spacing)));
       SaveState();
    }
 
@@ -740,26 +924,62 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(!IsOurMagic(magic)) return;
 
    double dealPrice = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   double dealVol   = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+   double dealProf  = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                    + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                    + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
    long   entryType = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   long   dealReason= HistoryDealGetInteger(trans.deal, DEAL_REASON);
    int    side      = SideFromMagic(magic);
    int    level     = LevelFromMagic(magic);
+   int    si        = SideIdx(side);
+   if(level < 1 || level > 8) return;
 
    if(entryType == DEAL_ENTRY_IN)
    {
-      double want = (side > 0)
-         ? g_anchor - LevelDepthPips(level, g_spacing) * g_pip
-         : g_anchor + LevelDepthPips(level, g_spacing) * g_pip;
-      double slipPips = (want > 0.0)
-         ? MathAbs(dealPrice - want) / g_pip : 0.0;
+      // Requested price is reconstructable from the FROZEN anchor + geometry.
+      double want = 0.0;
+      if(g_anchor > 0.0 && g_spacing > 0.0)
+         want = (side > 0)
+            ? g_anchor - LevelDepthPips(level, g_spacing) * g_pip
+            : g_anchor + LevelDepthPips(level, g_spacing) * g_pip;
+
+      double slipPips = (want > 0.0) ? MathAbs(dealPrice - want) / g_pip : 0.0;
+
+      g_entryTime[si][level] = TimeCurrent();
+      g_entryReq[si][level]  = want;
+      g_cycleEntries++;
+      if(level > g_cycleMaxLevel) g_cycleMaxLevel = level;
+
+      CsvLogDeal("ENTRY", side, level, want, dealPrice, slipPips,
+                 dealVol, 0.0, 0);
+
       Log(StringFormat("FILL  %s L%d  want=%.5f got=%.5f  slip=%.2fp",
                        (side > 0 ? "BUY" : "SELL"), level, want,
                        dealPrice, slipPips));
    }
    else if(entryType == DEAL_ENTRY_OUT)
    {
-      double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
-      Log(StringFormat("EXIT  %s L%d  @ %.5f  profit=%.2f",
-                       (side > 0 ? "BUY" : "SELL"), level, dealPrice, profit));
+      long holdSecs = (g_entryTime[si][level] > 0)
+                    ? (long)(TimeCurrent() - g_entryTime[si][level]) : 0;
+
+      // DEAL_REASON distinguishes a take-profit from a basket/disaster exit.
+      string ev;
+      if(dealReason == DEAL_REASON_TP)      { ev = "TP_EXIT";   g_cycleTPs++; }
+      else if(dealReason == DEAL_REASON_SL) { ev = "SL_EXIT";   g_cycleStopExits++; }
+      else                                  { ev = "STOP_EXIT"; g_cycleStopExits++; }
+
+      g_cycleRealized += dealProf;
+
+      CsvLogDeal(ev, side, level, g_entryReq[si][level], dealPrice, 0.0,
+                 dealVol, dealProf, holdSecs);
+
+      g_entryTime[si][level] = 0;
+      g_entryReq[si][level]  = 0.0;
+
+      Log(StringFormat("%s  %s L%d  @ %.5f  pl=%.2f  held=%I64ds",
+                       ev, (side > 0 ? "BUY" : "SELL"), level,
+                       dealPrice, dealProf, holdSecs));
    }
 }
 //+------------------------------------------------------------------+
