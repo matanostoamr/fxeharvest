@@ -219,6 +219,7 @@ def run_harvester(close: np.ndarray, p: Params, verbose: bool = False) -> Stats:
     spacing: float = p.spacing_min
     depths: list[float] = []
     cooldown = 0
+    cycle_entries = 0        # fills in the CURRENT cycle (see release guard)
     start_equity_pips = 1000.0 / USD_PER_PIP_PER_MICROLOT   # $1000 reference
 
     for i in range(n):
@@ -255,6 +256,7 @@ def run_harvester(close: np.ndarray, p: Params, verbose: bool = False) -> Stats:
             spacing = float(np.clip(p.atr_mult * atr[i],
                                     p.spacing_min, p.spacing_max))
             depths = p.level_depths(spacing)
+            cycle_entries = 0
             state = State.ACTIVE
 
         # ---------- ACTIVE --------------------------------------------------
@@ -281,6 +283,7 @@ def run_harvester(close: np.ndarray, p: Params, verbose: bool = False) -> Stats:
                                 1, k, entry, entry + p.tp_pips,
                                 p.lots_per_level * size_mult)
                             st.n_levels_filled += 1
+                            cycle_entries += 1
             elif dist > 0:                                 # price above anchor -> sell
                 if rs[i] <= p.rsi_short_veto:
                     for k, d in enumerate(depths, start=1):
@@ -290,6 +293,7 @@ def run_harvester(close: np.ndarray, p: Params, verbose: bool = False) -> Stats:
                                 -1, k, entry, entry - p.tp_pips,
                                 p.lots_per_level * size_mult)
                             st.n_levels_filled += 1
+                            cycle_entries += 1
 
         # (c) unrealized + MAE
         unreal = 0.0
@@ -315,10 +319,20 @@ def run_harvester(close: np.ndarray, p: Params, verbose: bool = False) -> Stats:
             state = State.COOLDOWN
             cooldown = p.cooldown_bars
 
-        # (e) all closed naturally -> release the anchor
-        elif not positions:
+        # (e) Release the anchor only when a REAL cycle finished, i.e. levels
+        #     filled and then all took profit. Releasing on `not positions`
+        #     alone also fires in the instant after arming, which in the MT5
+        #     port meant the resting ladder was withdrawn on the next tick:
+        #     1,053 pending orders placed, 1 filled, over one week.
+        #
+        #     NOTE ON REALISM: this simulator fills a level the moment price
+        #     is beyond it, whereas MT5 requires the limit order to be resting
+        #     when price arrives. This model is therefore OPTIMISTIC about fill
+        #     counts; treat its trade frequency as an upper bound.
+        elif not positions and cycle_entries > 0:
             state = State.FLAT
             anchor = None
+            cycle_entries = 0
 
         st.equity_curve.append(st.realized_pips + unreal)
 

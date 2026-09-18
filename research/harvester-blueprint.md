@@ -335,6 +335,52 @@ Useful reference numbers from the 3-year synthetic run (mechanics validation):
 
 ---
 
+## 7b. Field notes from the first real-tick backtest
+
+Pepperstone UK demo, EUR/USD M15, 2026.08.27–09.02, 100% real ticks (311,511 ticks,
+384 bars), £500 @ 1:30. Short sample, but it settled several things.
+
+**Geometry verified against the broker's own order records.** Reverse-engineering
+anchor and spacing from the placed order prices gives spacing **7.04 pips** (the
+`InpSpacingMinPips` floor, so ATR20(M15) was under 3.5 pips that week) and anchor
+**1.16519**. Every level, take-profit and stop matched spec to **under 0.5 pip**:
+
+| | Broker | Spec | Diff |
+|---|---|---|---|
+| buy L1 | 1.16449 | 1.16449 | 0.00p |
+| buy L2 | 1.16361 | 1.16361 | 0.00p |
+| sell L1 | 1.16589 | 1.16590 | 0.08p |
+| sell L2 | 1.16676 | 1.16678 | 0.18p |
+| buy L1 TP | 1.16499 | 1.16499 | 0.00p |
+| buy L1 SL | 1.15609 | 1.15604 | 0.48p |
+
+**Cost model confirmed.** The single completed trade: gross £0.37, commission £0.04,
+net £0.33 — a **10.8% cost ratio** against the 10.0% predicted in §0. The cost
+arithmetic in this document can be trusted.
+
+**One bug, and it was severe.** 1,053 pending orders placed, **1 filled — a 0.095%
+fill rate.** Cause: the "book emptied → re-anchor" branch keyed on
+`state==ACTIVE && positions==0`, which is *also* true in the instant after arming,
+before anything has been touched. The EA withdrew its own ladder on the next tick,
+re-armed on the next bar, and repeated. A resting limit cannot fill if it is
+cancelled milliseconds after placement. Fixed by gating that branch on
+`entries_this_cycle > 0`, plus a stale-anchor rule: re-anchor only when the SMA has
+drifted more than one spacing from the frozen anchor.
+
+**Lesson worth generalising:** the failure was invisible in aggregate P&L (+£0.33,
+100% win rate, profit factor 17.5 — superficially fine). It was only visible in the
+**order-to-fill ratio**. Watch that number from the first run.
+
+**Simulator realism gap.** `harvester.py` fills a level the moment price is beyond
+it; MT5 requires the order to be *resting* when price arrives. The Python model is
+therefore optimistic on trade frequency — treat its fill counts as an upper bound,
+not a forecast.
+
+**Also observed:** the one fill took **6h10m** to capture 5 pips, and zero basket
+stops fired in the week. Both are single-sample facts, not evidence of anything.
+
+---
+
 ## 8. What I'd instrument from day one
 
 Since the stated goal is to see the mechanics, log these per basket cycle — they are what make

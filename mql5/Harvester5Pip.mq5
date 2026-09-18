@@ -809,20 +809,54 @@ void OnTick()
    }
 
    //================================================================
-   // 4. Book emptied naturally -> release the anchor and re-arm fresh.
-   //    Pendings are cancelled too: holding them against a stale anchor
-   //    is how a grid ends up laddering around a price that is no
-   //    longer the rolling mean.
+   // 4. Distinguish "cycle finished" from "ladder not filled yet".
+   //
+   //    BUG FIXED HERE (found by the first real-tick backtest):
+   //    this block used to fire on (state==ACTIVE && nPos==0) alone. That
+   //    condition is ALSO true in the instant after arming, before any
+   //    level has been touched. The EA therefore cancelled the ladder on
+   //    the very next tick after placing it, re-armed on the next bar, and
+   //    repeated -- 1,053 pending orders placed and 1 filled over a
+   //    one-week run (0.095% fill rate). A resting limit cannot fill if it
+   //    is withdrawn milliseconds after being placed.
+   //
+   //    g_cycleEntries > 0 is what separates the two states.
    //================================================================
    if(g_state == HS_ACTIVE && nPos == 0)
    {
-      if(CountOurPendings() > 0) CancelAllPendings();
-      double dPip = (g_anchor > 0.0) ? MathAbs(mid - g_anchor) / g_pip : 0.0;
-      CloseCycle("all_tp_closed", dPip, g_cycleRealized);
-      g_state  = HS_FLAT;
-      g_anchor = 0.0;
-      Log("basket closed out -> FLAT (anchor released, will re-arm)");
-      SaveState();
+      if(g_cycleEntries > 0)
+      {
+         // A genuine cycle completed: every filled level took profit.
+         if(CountOurPendings() > 0) CancelAllPendings();
+         double dPip = (g_anchor > 0.0) ? MathAbs(mid - g_anchor) / g_pip : 0.0;
+         CloseCycle("all_tp_closed", dPip, g_cycleRealized);
+         g_state  = HS_FLAT;
+         g_anchor = 0.0;
+         Log("basket closed out -> FLAT (anchor released, will re-arm)");
+         SaveState();
+      }
+      else if(isNewBar && g_anchor > 0.0 && g_spacing > 0.0)
+      {
+         // Ladder is resting and nothing has filled. LEAVE IT ALONE -- that
+         // is the whole point of a resting limit. Re-anchor only when the
+         // rolling mean has drifted more than one spacing from the frozen
+         // anchor, i.e. when the levels have genuinely gone stale.
+         double maNow;
+         if(ReadBuf(hMA, 0, maNow))
+         {
+            double driftPips = MathAbs(maNow - g_anchor) / g_pip;
+            if(driftPips > g_spacing)
+            {
+               CancelAllPendings();
+               CloseCycle("reanchor_drift", driftPips, 0.0);
+               g_state  = HS_FLAT;
+               g_anchor = 0.0;
+               Log(StringFormat("anchor stale: SMA drifted %.1fp > spacing "
+                                "%.1fp -> re-anchoring", driftPips, g_spacing));
+               SaveState();
+            }
+         }
+      }
    }
 
    //================================================================
